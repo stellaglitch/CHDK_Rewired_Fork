@@ -204,6 +204,8 @@ long kbd_update_key_state(void)
         extern void posd_hide_now(int hold_ms, int clear_all);
         if (kbd_is_key_pressed(KEY_SHOOT_FULL))
             posd_hide_now(CAM_PERSISTENT_OSD_SHOT_HIDE_MS, 1);
+        else if (kbd_is_key_pressed(KEY_SHOOT_FULL))
+            posd_hide_now(CAM_PERSISTENT_OSD_SHOT_HIDE_MS, 0);
     }
 #endif
 
