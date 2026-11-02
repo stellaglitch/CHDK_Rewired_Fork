@@ -1,4 +1,4 @@
-# CHDK Rewired
+# CHDK Rewired Fork
 
 A fork of [CHDK](https://chdk.fandom.com/wiki/CHDK) that turns early Canon PowerShots into instruments for deliberate image corruption.
 
