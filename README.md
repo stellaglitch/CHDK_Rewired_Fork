@@ -1,12 +1,6 @@
 # CHDK Rewired Fork With fixes for the a540
 
-A fork of a fork of [CHDK](https://chdk.fandom.com/wiki/CHDK) that turns early Canon PowerShots into instruments for deliberate image corruption.
-
-<p align="center">
-
-  <img src="images/overlay.jpg" width="750">
-
-</p>
+A fork of [CHDK_Rewired](https://github.com/lr-m/CHDK_Rewired) that fixes an issue with the a540 causing it to crash after 1-2 flash photos are taken. 
 
 ## Supported cameras
 
@@ -16,8 +10,9 @@ A fork of a fork of [CHDK](https://chdk.fandom.com/wiki/CHDK) that turns early C
 
 ## Installing
 
-1. Install the normal CHDK_Rewired firmware onto your a540.
+1. Install the normal CHDK_Rewired firmware onto your a540 by following their tutorial. (https://github.com/lr-m/CHDK_Rewired)
 2. Download this repo, unzip it, then click and drag it onto your a540's SD card. Make sure to copy and replace over the existing files on the card.
+3. Use your Canon a540 to take circuit-bent photos with flash without crashes!
 
 ## Firmware
 
