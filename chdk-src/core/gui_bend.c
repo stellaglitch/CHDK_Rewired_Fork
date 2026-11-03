@@ -164,10 +164,12 @@ static int bm_br_drawn_h;       // height of the panel as last drawn, for the er
 // next Left/Right or rocker press reaches.
 #define BM_X_AMOUNT  0
 #define BM_X_REACH   1
-#define BM_X_LANES   2
-#define BM_X_MIX     3
-#define BM_X_BANDS   4
-#define BM_X_KNOBS   5
+#define BM_X_TINT    2
+#define BM_X_PROTECT 3
+#define BM_X_LANES   4
+#define BM_X_MIX     5
+#define BM_X_BANDS   6
+#define BM_X_KNOBS   7
 static int bm_x_knob;
 static int bm_x_open = -1;
 #endif
@@ -449,8 +451,14 @@ static int bm_tab_fixed(void)
     // list because it is not a layout and not a region - it is a way of
     // looking at both, and it belongs at the top where it can be reached
     // without walking past seventeen layouts.
+    // X has one: the live preview switch, for the same reason - it is not an
+    // effect, it is a way of seeing all of them, and before this it could
+    // only be reached through ALT and two levels of CHDK menu.
     if (bm_tab == BM_TAB_SAVED) return 3;
     if (bm_tab == BM_TAB_SEG)   return 1;
+#ifdef CAM_BEND_EXPERIMENTAL
+    if (bm_tab == BM_TAB_X)     return 1;
+#endif
     return 0;
 }
 
@@ -794,11 +802,11 @@ static void bm_x_remove(int kind)
 }
 
 static const char * const bm_x_knob_names[BM_X_KNOBS] = {
-    "Amount", "Reach", "Data lanes", "Mix", "Row bands"
+    "Amount", "Reach", "Colour", "Protect", "Data lanes", "Mix", "Row bands"
 };
 
 // Turn whichever control the selector row names. This is deliberately the
-// same five-value surface as the full menu, so the browser is not a reduced
+// same seven-value surface as the full menu, so the browser is not a reduced
 // editor with a hidden second half.
 static void bm_x_step(int delta)
 {
@@ -828,6 +836,22 @@ static void bm_x_step(int delta)
         while (v < 0)    v += max + 1;
         while (v > max)  v -= max + 1;
         live->reach = (unsigned char)v;
+        break;
+    case BM_X_TINT:
+        max = bendx_tint_max(live->kind);
+        if (max <= 0) { bm_note_set("no colour on this one"); return; }
+        v = (int)live->tint + delta;
+        while (v < 0)    v += max + 1;
+        while (v > max)  v -= max + 1;
+        live->tint = (unsigned char)v;
+        break;
+    case BM_X_PROTECT:
+        max = bendx_protect_max(live->kind);
+        if (max <= 0) { bm_note_set("nothing to protect on this one"); return; }
+        v = (int)live->protect + delta;
+        while (v < 0)    v += max + 1;
+        while (v > max)  v -= max + 1;
+        live->protect = (unsigned char)v;
         break;
     case BM_X_LANES:
         v = (int)live->lanes + delta;
@@ -1238,6 +1262,19 @@ static void bm_browse_pick(void)
         bm_dirty = 1;
         return;
     }
+#ifdef CAM_BEND_EXPERIMENTAL
+    if (bm_tab == BM_TAB_X && bm_bsel < fixed)
+    {
+        // The preview is drawn on the shooting screen only - this panel and
+        // the region mask own the same layer while it is open - so say where
+        // to look rather than leave an "on" that shows nothing.
+        conf.bend_preview = !conf.bend_preview;
+        bm_note_set(conf.bend_preview ? "preview on - close to see"
+                                      : "preview off");
+        bm_dirty = 1;
+        return;
+    }
+#endif
     if (idx >= n) { bm_browse_close(); return; }                // Back
 
     if (bm_tab == BM_TAB_SEG) { bm_seg_pick(idx); return; }
@@ -1715,6 +1752,8 @@ static void bm_x_row(int y, int idx, int sel)
             if (bendx_reach_max(kind) > 0) sprintf(right, "%d", p->reach);
             else strcpy(right, "-");
             break;
+        case BM_X_TINT: strcpy(right, bendx_tint_name(p)); break;
+        case BM_X_PROTECT: strcpy(right, bendx_protect_name(p)); break;
         case BM_X_LANES:
             if (!p->lanes) strcpy(right, "all");
             else
@@ -2194,6 +2233,14 @@ static void bm_browse_draw(void)
 #ifdef CAM_BEND_EXPERIMENTAL
     else
     {
+        // The preview switch, above the effects - see bm_tab_fixed(). One
+        // switch for the matrix and the chain, the same int the menus bind.
+        bm_row(y, bm_bsel == 0,
+               conf.bend_preview ? "Live preview: on" : "Live preview: off",
+               0,
+               conf.bend_preview ? theme_color(TC_ACCENT) : theme_color(TC_DIM));
+        y += FONT_HEIGHT;
+
         for (i = bm_btop; i < bm_btop + shown && i < n; i++)
         {
             bm_x_row(y, i, bm_bsel == fixed + i);
@@ -2478,13 +2525,14 @@ static void bm_draw(int force)
     hash = hash * 43 + bm_confirm * 3 + bm_confirm_yes;
     hash = hash * 67 + conf.bend_seg_mask;
 #ifdef CAM_BEND_EXPERIMENTAL
-    hash = hash * 5 + conf.bendx_enable + bm_x_knob * 7;
+    hash = hash * 5 + conf.bendx_enable + bm_x_knob * 7 + conf.bend_preview * 13;
     hash = hash * 17 + conf.bendx.n;
     for (i = 0; i < BENDX_CHAIN_MAX; i++)
         hash = hash * 41 + conf.bendx.item[i].kind * 7
              + conf.bendx.item[i].amount * 3 + conf.bendx.item[i].reach
              + conf.bendx.item[i].lanes * 5 + conf.bendx.item[i].mix * 11
-             + conf.bendx.item[i].rowmod * 13;
+             + conf.bendx.item[i].rowmod * 13 + conf.bendx.item[i].tint * 19
+             + conf.bendx.item[i].protect * 23;
 #endif
     for (i = 0; i < BM_NBITS; i++) hash = hash * 33 + bend_seg_cur()->route[i];
     if (!force && !bm_dirty && hash == last_hash) return;

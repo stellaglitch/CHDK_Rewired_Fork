@@ -236,10 +236,14 @@ static void sweep(int nbits, unsigned rowpix, unsigned rows)
             x.mix    = (unsigned char)(n % BXMIX_COUNT);
             x.lanes  = lane_set[n % 4];
             x.rowmod = rowmod_set[n % 3];
+            x.tint   = (unsigned char)(n % (bendx_tint_max(kind) + 1));
+            x.protect = (unsigned char)((n / 3) % (bendx_protect_max(kind) + 1));
             x.seed   = 0x9e3779b9u ^ (unsigned)(kind * 7 + a * 13 + r);
 
             bendx_sanitize(&x);
-            if (x.kind != kind || x.amount != a || x.reach != r)
+            if (x.kind != kind || x.amount != a || x.reach != r
+             || x.tint != n % (bendx_tint_max(kind) + 1)
+             || x.protect != (n / 3) % (bendx_protect_max(kind) + 1))
                 { fail("bendx_sanitize rejected an in-range profile"); return; }
 
             fence_fill(&buf, 0xbeef ^ (unsigned)(kind * 31 + a));
