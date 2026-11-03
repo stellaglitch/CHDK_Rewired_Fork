@@ -19,6 +19,7 @@
 #include "bend_seg.h"
 #include "bend_shot.h"
 #include "bend_tag.h"
+#include "bend_preview.h"
 #include "mexp.h"
 #include "mexp_ghost.h"
 #include "file_counter.h"
@@ -908,6 +909,11 @@ void raw_bendx(void)
     env.frame = bb_frame;
     env.black = camera_sensor.black_level;
     env.white = camera_sensor.white_level;
+    env.g_even = (camera_sensor.cfa_pattern == 0x01020001       // G R B G
+               || camera_sensor.cfa_pattern == 0x01000201);     // G B R G
+    env.r_odd  = (camera_sensor.cfa_pattern == 0x00010102       // B G G R
+               || camera_sensor.cfa_pattern == 0x01000201);     // G B R G
+    bend_preview_neutral(env.neutral);
 
     // Whatever the largest member of the chain asks for - two rows for most of
     // them, more for the sort, which wants a counting histogram wider than two

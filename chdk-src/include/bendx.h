@@ -73,7 +73,12 @@
 #define BX_LOCK         17  // PLL losing lock and re-acquiring, per row
 #define BX_JPGBUS       18  // the JPEG encoder's buffer on the data lanes
 
-#define BX_COUNT        19
+// Process, like the sort: modelled on reference photos, not on a fault.
+#define BX_MELT         19  // highlights draining down the columns
+#define BX_AERO         20  // Kodak Aerochrome false-colour infrared film
+#define BX_RAIN         21  // thin flat streaks raining out of the clouds
+
+#define BX_COUNT        22
 
 //-------------------------------------------------------------------
 // How the effect's output is put back. For the foreign buses this is the
@@ -98,9 +103,29 @@ typedef struct
     unsigned char lanes;        // data bus lane mask, 0 = all eight
     unsigned char mix;          // BXMIX_*
     unsigned char rowmod;       // effect on for bands of N rows, 0/1 = always
-    unsigned char pad[2];
+    unsigned char tint;         // colour mode, 0 .. bendx_tint_max(); was
+                                // padding, so old config blocks read as 0
+    unsigned char protect;      // BXPROT_*, 0 .. bendx_protect_max(); the
+                                // last padding byte, so likewise 0 = off
     unsigned      seed;
 } bendx_t;
+
+//-------------------------------------------------------------------
+// Colour modes, for the effects that paint (bendx_tint_max() > 0).
+
+#define BXTINT_CLASSIC  0   // the fixed pink body and green band
+#define BXTINT_IMAGE    1   // the image's strongest colour, and its complement
+#define BXTINT_LOCAL    2   // the complement of whatever each streak runs over
+
+// What an effect that paints is allowed to paint over.
+#define BXPROT_OFF      0   // everything
+#define BXPROT_SKY      1   // only what looks like sky or cloud - the subject
+                            // in front of it is left as it was
+
+// Aerochrome uses the same knob for the filter over the lens.
+#define BXTINT_YELLOW   0   // Wratten 12, Kodak's recommended filter
+#define BXTINT_ORANGE   1   // Wratten 21: deeper reds, darker sky
+#define BXTINT_RED      2   // Wratten 25: red and yellow on near-black
 
 //-------------------------------------------------------------------
 // The buffer being bent. Supplied by the caller because the engine has no way
@@ -135,6 +160,12 @@ typedef struct
     unsigned frame;             // shot counter, for the effects that drift
     unsigned black;             // camera_sensor.black_level
     unsigned white;             // camera_sensor.white_level
+    unsigned g_even;            // 1 if green sits where x+y is even (GRBG,
+                                // GBRG), 0 where it is odd (RGGB, BGGR)
+    unsigned r_odd;             // 1 if red is on the odd rows (BGGR, GBRG)
+    unsigned neutral[3];        // raw R, G, B of a daylight-white surface,
+                                // green = 1000, from the DNG colour matrix;
+                                // all 0 if the port has none
 } bendx_env_t;
 
 //-------------------------------------------------------------------
@@ -240,6 +271,15 @@ void bendx_sanitize(bendx_t *x);
 // effects that return 0.
 int  bendx_amount_max(int kind);
 int  bendx_reach_max(int kind);
+
+// The colour mode knob: 0 for effects that have none, and its name for the
+// UIs ("-" when the effect has none).
+int         bendx_tint_max(int kind);
+const char *bendx_tint_name(const bendx_t *x);
+
+// The protect knob, likewise: 0 for effects that have none.
+int         bendx_protect_max(int kind);
+const char *bendx_protect_name(const bendx_t *x);
 
 // Whether this effect has to unpack the buffer. The UI marks these because on
 // these bodies it is the difference between a shot that saves and a shot you

@@ -570,6 +570,19 @@ typedef struct
     int raw_ev_histo_ettr_pct;
     int raw_ev_histo_save_for_image;
 
+    // Approximate live preview of the bend matrix and the experimental chain,
+    // drawn over the live view - see core/bend_preview.c. At the end of the
+    // struct so that adding it moves no field a module already reads.
+    int bend_preview;
+
+    // The record UI's SIZE and QUALITY choices (gui_recui.c), as index + 1
+    // into the port's tables, 0 = leave Canon's value alone. Canon reloads
+    // both from its own per-mode store at power-on and on every mode change,
+    // and only Canon's FUNC menu - which CAM_RECUI replaces - writes that
+    // store, so without these a choice lasts until the dial moves.
+    int recui_size;
+    int recui_quality;
+
 } Conf;
 
 extern Conf conf;

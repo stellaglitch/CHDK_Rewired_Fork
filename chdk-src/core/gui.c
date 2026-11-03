@@ -37,6 +37,7 @@
 #include "mexp_ghost.h"
 #include "theme.h"
 #include "bend_tag.h"
+#include "bend_preview.h"
 #include "stdio.h"
 
 // splash screen time
@@ -2577,6 +2578,40 @@ static const char* gui_bendx_reach_enum(int change, __attribute__ ((unused))int 
     return bendx_ui_buf;
 }
 
+static const char* gui_bendx_tint_enum(int change, __attribute__ ((unused))int arg)
+{
+    bendx_t *x = bendx_ui_live();
+    int max, v;
+
+    if (!x) return "-";
+    max = bendx_tint_max(x->kind);
+    if (max <= 0) return "-";
+
+    v = (int)x->tint + change;
+    while (v < 0)   v += max + 1;
+    while (v > max) v -= max + 1;
+    x->tint = (unsigned char)v;
+
+    return bendx_tint_name(x);
+}
+
+static const char* gui_bendx_protect_enum(int change, __attribute__ ((unused))int arg)
+{
+    bendx_t *x = bendx_ui_live();
+    int max, v;
+
+    if (!x) return "-";
+    max = bendx_protect_max(x->kind);
+    if (max <= 0) return "-";
+
+    v = (int)x->protect + change;
+    while (v < 0)   v += max + 1;
+    while (v > max) v -= max + 1;
+    x->protect = (unsigned char)v;
+
+    return bendx_protect_name(x);
+}
+
 static const char* gui_bendx_mix_enum(int change, __attribute__ ((unused))int arg)
 {
     bendx_t *x = bendx_ui_live();
@@ -2771,6 +2806,8 @@ void gui_bend_shot_prompt(void)
 
 static CMenuItem bendx_submenu_items[] = {
     MENU_ITEM   (0x5c,(int)"Enable",            MENUITEM_BOOL,      &conf.bendx_enable, 0 ),
+    // The same switch as in the bend menu above: one preview for both engines.
+    MENU_ITEM   (0x5c,(int)"Live preview",      MENUITEM_BOOL,      &conf.bend_preview, 0 ),
     MENU_ITEM   (0x5f,(int)"Stacked",           MENUITEM_ENUM,      gui_bendx_chain_enum, 0 ),
 
     // Everything below edits the live slot. The locked ones are frozen by
@@ -2780,6 +2817,8 @@ static CMenuItem bendx_submenu_items[] = {
     MENU_ITEM   (0x0 ,(int)"",                  MENUITEM_ENUM,      gui_bendx_desc_enum, 0 ),
     MENU_ITEM   (0x5f,(int)"Amount",            MENUITEM_ENUM,      gui_bendx_amount_enum, 0 ),
     MENU_ITEM   (0x5f,(int)"Reach",             MENUITEM_ENUM,      gui_bendx_reach_enum, 0 ),
+    MENU_ITEM   (0x5f,(int)"Colour",            MENUITEM_ENUM,      gui_bendx_tint_enum, 0 ),
+    MENU_ITEM   (0x5f,(int)"Protect",           MENUITEM_ENUM,      gui_bendx_protect_enum, 0 ),
     MENU_ITEM   (0x2a,(int)"Reroll the knobs",  MENUITEM_PROC,      gui_bendx_random, 0 ),
 
     MENU_ITEM   (0x0 ,(int)"Stack",             MENUITEM_SEPARATOR, 0, 0 ),
@@ -2822,6 +2861,11 @@ static CMenuItem bitbend_submenu_items[] = {
     MENU_ITEM   (0x5f,(int)"Editing region",    MENUITEM_ENUM,      gui_bend_seg_active_enum, 0 ),
     MENU_ITEM   (0x5f,(int)"Size",              MENUITEM_ENUM,      gui_bend_seg_size_enum, 0 ),
     MENU_ITEM   (0x5c,(int)"Show pattern mask", MENUITEM_BOOL,      &conf.bend_seg_mask, 0 ),
+
+    // An approximation, over the live view - see core/bend_preview.c. Covers
+    // the experimental chain as well as the matrix, and is listed here rather
+    // than twice because it is one switch for both.
+    MENU_ITEM   (0x5c,(int)"Live preview",      MENUITEM_BOOL,      &conf.bend_preview, 0 ),
 
     // The second engine, one level down. It is not part of the matrix and it
     // does not belong inside its sections, but it is the other half of what
@@ -6084,16 +6128,38 @@ void gui_redraw()
         // In particular, Bend owns GUI_MODE_MODULE and draws its segment mask
         // over the same image area; repainting the ghost there makes the two
         // masks fight on every repair tick.
-        if (camera_info.state.gui_mode_none &&
+        int shooting_screen = camera_info.state.gui_mode_none &&
             camera_info.state.mode_rec && !camera_info.state.mode_play &&
             !canon_menu_hidden && !kbd_is_key_pressed(KEY_SHOOT_FULL) &&
-            !posd_shot_hold() &&
-            mexp_in_progress() && mexp_ghost_have() &&
+            !posd_shot_hold();
+        int ghosting = mexp_in_progress() && mexp_ghost_have();
+
+        if (shooting_screen && ghosting &&
             (flag_gui_enforce_redraw || !ghost_tick || (t - ghost_tick) >= 200))
         {
             mexp_ghost_draw(flag_gui_enforce_redraw);
             ghost_tick = t;
             flag_gui_enforce_redraw = 1;
+        }
+
+        // The bend preview, in the same layer and on the same screens, and
+        // never at the same time as the ghost - both own the whole plane. A
+        // step every 150ms: build, paint the top half, paint the bottom half.
+        // Building draws nothing, so only a paint makes the layers above
+        // repaint.
+        {
+            static int preview_tick;
+            if (shooting_screen && !ghosting && bend_preview_wanted())
+            {
+                if (flag_gui_enforce_redraw || !preview_tick || (t - preview_tick) >= 150)
+                {
+                    if (bend_preview_draw(flag_gui_enforce_redraw))
+                        flag_gui_enforce_redraw = 1;
+                    preview_tick = t;
+                }
+            }
+            else
+                bend_preview_idle(kbd_is_key_pressed(KEY_SHOOT_FULL) || posd_shot_hold());
         }
     }
 #endif

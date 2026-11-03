@@ -644,6 +644,17 @@ static ConfInfo conf_info[] = {
     // new list empty. Kept last because gen_conf_lua uses the final ID.
     CONF_INFO(308, conf.bendx,                                  CONF_INT_PTR,   i:0),
 
+    // Live preview of the bends (bend_preview.c). Not 287: that was the old
+    // preview that wrote into Canon's viewport, and it stays retired. Off by
+    // default - it costs CPU and 47KB of heap while it runs.
+    CONF_INFO(309, conf.bend_preview,                           CONF_DEF_VALUE, i:0),
+
+    // Record UI SIZE and QUALITY, kept across power cycles and mode changes -
+    // see gui_recui.c. SIZE defaults to the first, largest entry; QUALITY to
+    // leaving Canon's own value alone until one is picked.
+    CONF_INFO(310, conf.recui_size,                             CONF_DEF_VALUE, i:1),
+    CONF_INFO(311, conf.recui_quality,                          CONF_DEF_VALUE, i:0),
+
     CONF_INFO(999, conf.script_allow_lua_native_calls,          CONF_DEF_VALUE, i:0),
 
     {0}

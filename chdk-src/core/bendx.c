@@ -47,6 +47,9 @@ static const char * const bx_names[BX_COUNT] = {
     "Pixel sort",       // BX_SORT
     "Lock loss",        // BX_LOCK
     "JPEG bus",         // BX_JPGBUS
+    "Melt",             // BX_MELT
+    "Aerochrome",       // BX_AERO
+    "Sky rain",         // BX_RAIN
 };
 
 // One line each, for the menu. What the hardware fault is, not what the code
@@ -71,6 +74,9 @@ static const char * const bx_descs[BX_COUNT] = {
     "Runs sorted along the row",
     "Timing losing lock and re-finding",
     "The JPEG buffer on the data lanes",
+    "Highlights draining down the frame",
+    "Kodak's false-colour infrared film",
+    "Thin streaks falling from the clouds",
 };
 
 //-------------------------------------------------------------------
@@ -259,6 +265,9 @@ int bendx_amount_max(int kind)
     case BX_SORT:     return 15;    // threshold the runs are taken above
     case BX_LOCK:     return 15;    // how often lock is lost
     case BX_JPGBUS:   return 7;     // texture scale, as a shift
+    case BX_MELT:     return 15;    // how far below clipping a highlight starts
+    case BX_AERO:     return 15;    // how strongly foliage glows
+    case BX_RAIN:     return 15;    // how many streaks
     }
     return 0;
 }
@@ -280,8 +289,40 @@ int bendx_reach_max(int kind)
     case BX_SORT:     return 15;    // run length, and which way up - see below
     case BX_LOCK:     return 15;    // how far it jumps when it slips
     case BX_JPGBUS:   return 15;    // how fast the window walks
+    case BX_MELT:     return 15;    // how far the streaks run
+    case BX_AERO:     return 15;    // saturation of the dye layers
+    case BX_RAIN:     return 15;    // how far they fall
     }
     return 0;
+}
+
+int bendx_tint_max(int kind)
+{
+    if (kind == BX_MELT || kind == BX_RAIN) return BXTINT_LOCAL;
+    if (kind == BX_AERO) return BXTINT_RED;
+    return 0;
+}
+
+int bendx_protect_max(int kind)
+{
+    return (kind == BX_MELT || kind == BX_RAIN) ? BXPROT_SKY : 0;
+}
+
+const char *bendx_protect_name(const bendx_t *x)
+{
+    if (bendx_protect_max(x->kind) <= 0) return "-";
+    return (x->protect == BXPROT_SKY) ? "Sky only" : "Off";
+}
+
+const char *bendx_tint_name(const bendx_t *x)
+{
+    static const char * const melt[] = { "Classic", "Image", "Local" };
+    static const char * const aero[] = { "Yellow 12", "Orange 21", "Red 25" };
+    int max = bendx_tint_max(x->kind);
+    int t = (x->tint <= max) ? x->tint : 0;
+
+    if (max <= 0) return "-";
+    return (x->kind == BX_AERO) ? aero[t] : melt[t];
 }
 
 int bendx_is_slow(int kind)
@@ -289,7 +330,7 @@ int bendx_is_slow(int kind)
     switch (kind)
     {
     case BX_CLOCK: case BX_CFA:   case BX_CLAMP:
-    case BX_BLOOM: case BX_SORT:
+    case BX_BLOOM: case BX_SORT:  case BX_MELT: case BX_AERO: case BX_RAIN:
         return 1;
     }
     return 0;
@@ -317,6 +358,17 @@ unsigned bendx_scratch_bytes(int kind, unsigned rowlen)
         // exists rather than a constant.
         unsigned hist = BX_SORT_BUCKETS * sizeof(unsigned short);
         return (hist > two) ? hist : two;
+    }
+    if (kind == BX_MELT || kind == BX_RAIN)
+    {
+        // Four shorts per two-pixel cell is four bytes per pixel, and a
+        // pixel is at least 1.25 bytes of row at either depth, so four rows
+        // always cover it. Then four bytes of alignment
+        // and the colour grid: BXM_GH rows of blocks 64 cells wide, one more
+        // for the whole frame, and one row more for the blend of the two grid
+        // rows around the current row - sixteen bytes a block. A cell is at
+        // least 2.5 bytes of row, so rowlen / 128 + 2 columns always covers it.
+        return rowlen * 4u + 4u + 16u * (17u * (rowlen / 128u + 2u) + 1u);
     }
     return two;
 }
@@ -356,8 +408,8 @@ void bendx_reset(bendx_t *x)
     x->lanes  = 0;
     x->mix    = BXMIX_SET;
     x->rowmod = 0;
-    x->pad[0] = 0;
-    x->pad[1] = 0;
+    x->tint    = BXTINT_CLASSIC;
+    x->protect = BXPROT_OFF;
     x->seed   = 0xb1a5edu;
 }
 
@@ -390,6 +442,9 @@ void bendx_set_kind(bendx_t *x, int kind)
     x->seed = keep ? keep : x->seed;
     x->kind = (unsigned char)kind;
     if (bendx_needs_env(kind)) x->mix = BXMIX_XOR;
+    // Sky rain is for keeping the subject out of it; starting it with the
+    // subject unprotected would show the one look it was not made for.
+    if (kind == BX_RAIN) x->protect = BXPROT_SKY;
 
     bendx_sanitize(x);
 }
@@ -407,6 +462,8 @@ void bendx_sanitize(bendx_t *x)
 
     if (x->mix >= BXMIX_COUNT) x->mix = BXMIX_SET;
     if (x->rowmod > 64)        x->rowmod = 0;
+    if (x->tint > bendx_tint_max(x->kind)) x->tint = BXTINT_CLASSIC;
+    if (x->protect > bendx_protect_max(x->kind)) x->protect = BXPROT_OFF;
     if (!x->seed)              x->seed = 0xb1a5edu;
 }
 
@@ -1398,6 +1455,859 @@ static void bx_lock(const bendx_t *x, const bendx_buf_t *b,
 }
 
 //-------------------------------------------------------------------
+// Highlight melt.
+//
+// Taken from photographs, not from a fault - the same footing as the sort.
+// What the photographs show, and what each part of this is for:
+//
+//   - every highlight trails a streak straight down, the length varying
+//     column to column, finely ragged at the bottom but following the shape
+//     of the highlight above in the large - a pillar leaves a U-shaped tip;
+//   - it is white over bright parts of the scene and pink over dark ones;
+//   - it ends white, then a thin cyan line, then a thick, solid green band.
+//
+// The colours are made in the raw, not painted on. The streak carries red and
+// blue at the highlight's level and green well below it, and each site keeps
+// whichever is brighter, the streak or the scene. Canon's white balance does
+// the rest: over a dark scene red and blue clip and green does not, which is
+// pink; over a bright one the scene's own green fills in, which is white. At
+// the end green comes up to full a little before red stops (white), red stops
+// before blue (cyan), and green carries on after both (the green band).
+//
+// The streak is carried in cells two pixels wide, so both sites of a Bayer
+// pair stay together and the mosaic is never split down the middle of a
+// streak; demosaicing a half-streak is colour mud.
+//
+// Per cell: the level of the highlight that started it, how far down its own
+// length it has got, and how far it moves per row. Positions are in units of
+// the streak's length so that the shape is the same for a short streak and a
+// long one, and so that there is one division per streak rather than one per
+// pixel. That matters on a CPU with no divide instruction and six million
+// pixels.
+
+#define BXM_ONE     16384u          // a streak's whole length
+#define BXM_TOP     (BXM_ONE / 6u)  // white fading to pink over this much
+#define BXM_GPRE    (BXM_ONE / 10u) // green back to full this far before the end
+#define BXM_GMID    4096u           // green in the body, of the highlight: 0.25
+#define BXM_END     (BXM_ONE + BXM_ONE / 3u)
+
+static unsigned bxm_body(unsigned u)
+{
+    // 1 - u^16: flat for nearly all of the length, then a hard end.
+    unsigned w = (u * u) >> 14;
+    w = (w * w) >> 14;
+    w = (w * w) >> 14;
+    w = (w * w) >> 14;
+    return BXM_ONE - w;
+}
+
+// Length factor for a cell, /256: a smooth swell across groups of 32 cells so
+// the ends follow broad shapes, plus a little per-cell rag.
+static unsigned bxm_shape(unsigned seed, unsigned c)
+{
+    unsigned n = c >> 5, t = c & 31u;
+    unsigned a = 176u + (xs32(seed ^ (n * 0x85ebca6bu)) & 127u);
+    unsigned z = 176u + (xs32(seed ^ ((n + 1u) * 0x85ebca6bu)) & 127u);
+    // Smoothstep between the two, /1024, so the swells are rounded rather
+    // than straight-sided Vs.
+    unsigned sm = (t * t * (96u - 2u * t)) >> 5;
+    unsigned f = (a * (1024u - sm) + z * sm) >> 10;          // 0.69 .. 1.18
+    return (f * (248u + (xs32(seed ^ (c * 0x9e3779b9u)) & 15u))) >> 8;
+}
+
+//-------------------------------------------------------------------
+// Melt colours.
+//
+// A palette is six levels, /BXM_ONE of the highlight: the body's red, green
+// and blue, then the end band's. Classic is the pair the reference photos
+// show. The other two modes take a pair of complementary colours from the
+// photograph being bent: the band is a colour found in it and the body is
+// that colour's complement, so pink-and-green is just what a green scene
+// gives - which is also what they fall back to when the scene has no colour.
+//
+// The colour is measured from a sparse sample of the frame before anything
+// is drawn, in a grid of blocks BXM_GW cells wide and BXM_GH deep. Colour in
+// the raw is meaningless on its own - green always reads high, because the
+// sensor is most sensitive to it - so every block is judged against a white
+// reference: the sensor's daylight white from the port's DNG colour matrix
+// (env->neutral), or failing that the frame's average weighted by
+// brightness. Never the plain average: a frame that is half blue sky averages
+// blue, and then the sky counts as grey. The same reference turns the chosen
+// colour back into raw levels, so that after Canon's white balance it comes
+// out roughly as chosen - roughly, because Canon balances for the light it
+// thinks it saw, and in shade or indoors that is not daylight.
+//
+//   Image: one pair for the whole frame. The band is the frame's strongest
+//          colour - the blocks' colours, each weighted by how saturated it is -
+//          and the body its complement. Blue sky gives orange streaks with a
+//          blue end; a red wall, cyan with a red end.
+//   Local: each block's own colour, so a streak changes colour as it runs
+//          down: orange over sky, magenta over trees. Where a block is grey
+//          the frame's colour fills in, so neutral areas do not go white,
+//          and a dark block counts for less, because its colour is mostly
+//          noise. Blocks are blended into each other, never stepped.
+
+#define BXM_GW      64u             // palette block width, in cells
+#define BXM_GH      16u             // palette blocks down the frame
+#define BXM_SAT     512             // full chroma, as the L1 norm of a /256 deviation
+#define BXM_LGAIN   3               // how much a block's own colour is pushed
+
+static const unsigned short bxm_classic[6] = {
+    BXM_ONE, BXM_GMID, BXM_ONE,     // body: red and blue clip, green low - pink
+    0,       BXM_ONE,  0,           // band: green alone
+};
+
+static unsigned bxm_grid_cols(unsigned ncell)
+{
+    return ncell / BXM_GW + 1u;
+}
+
+static int bxm_abs(int v) { return (v < 0) ? -v : v; }
+
+static int bxm_l1(const int *c)
+{
+    return bxm_abs(c[0]) + bxm_abs(c[1]) + bxm_abs(c[2]);
+}
+
+// A chroma deviation (sums to ~0, L1 <= BXM_SAT) to a palette: band toward
+// it, body away from it, each scaled to full, then into raw levels.
+static void bxm_pair(const int *c, const unsigned *m, unsigned short *pal)
+{
+    unsigned mmax = m[0];
+    int side, k;
+
+    if (m[1] > mmax) mmax = m[1];
+    if (m[2] > mmax) mmax = m[2];
+
+    for (side = 0; side < 2; side++)
+    {
+        int col[3], top = 1;
+
+        for (k = 0; k < 3; k++)
+        {
+            col[k] = 256 + (side ? c[k] : -c[k]);
+            if (col[k] < 0) col[k] = 0;
+            if (col[k] > top) top = col[k];
+        }
+        for (k = 0; k < 3; k++)
+        {
+            unsigned want = ((unsigned)col[k] * 256u) / (unsigned)top;   // 0 .. 256
+            pal[side * 3 + k] = (unsigned short)((want * 64u * m[k]) / mmax);
+        }
+    }
+}
+
+// A block's colour: each channel divided by white's, then as a /256
+// deviation from their mean, so it sums to about zero and does not depend on
+// how bright the block is. Scaled down when the block is dark - below half of
+// gref, the frame's typical brightness, its colour is increasingly noise.
+// Returns 0 if the block had too few samples to say.
+static int bxm_chroma(const unsigned *blk, const unsigned *n, unsigned gref, int *d)
+{
+    unsigned br = blk[3] & 0xffffu, bb = blk[3] >> 16;
+    unsigned bg, conf;
+    int r[3], avg, k;
+
+    if (br < 4u || bb < 4u) return 0;
+    bg = blk[1] / (br + bb);
+    r[0] = (int)(((blk[0] / br) * 1024u) / n[0]);
+    r[1] = (int)((bg * 1024u) / n[1]);
+    r[2] = (int)(((blk[2] / bb) * 1024u) / n[2]);
+    avg = (r[0] + r[1] + r[2]) / 3;
+    if (avg <= 0) return 0;
+    conf = (bg * 512u) / (gref ? gref : 1u);
+    if (conf > 256u) conf = 256u;
+    for (k = 0; k < 3; k++)
+    {
+        d[k] = ((r[k] - avg) * 256) / avg;
+        if (d[k] >  512) d[k] =  512;
+        if (d[k] < -512) d[k] = -512;
+        d[k] = (d[k] * (int)conf) / 256;
+    }
+    return 1;
+}
+
+// Sample the frame and fill the grid with palettes. The grid is BXM_GH rows
+// of gx blocks, eight shorts a block, then one more block for the frame's
+// own pair. Returns 0 if the frame is too dark to measure; the caller then
+// uses Classic.
+static int bxm_palette(const bendx_t *x, const bendx_buf_t *b,
+                       const bendx_env_t *env, unsigned ncell, unsigned thr,
+                       unsigned black, unsigned *g, unsigned gx)
+{
+    unsigned nblk = gx * BXM_GH;
+    // Brightness-weighted sums for the white reference: red times green on
+    // red rows, green squared, blue times green on blue rows, and the green
+    // weights on each row phase. All /1024, so a whole frame fits.
+    unsigned sr = 0, sg = 0, sb = 0, wr = 0, wb = 0;
+    unsigned m[3], wt[3], y, c, i;
+    int dom[3] = { 0, 0, 0 };
+    int k;
+
+    for (i = 0; i < (nblk + 1u) * 4u; i++) g[i] = 0;
+
+    // Two rows in eight, so both Bayer row phases are seen, and every other
+    // cell. Highlights are left out - they are what streaks, not the scene.
+    for (y = 0; y < b->rows; y++)
+    {
+        BX_TICK(y);
+        const unsigned char *row;
+        unsigned gk, by;
+        int red;
+
+        if ((y & 7u) >= 2u) continue;
+        row = b->base + (unsigned)y * b->rowlen;
+        gk  = ((y & 1u) ^ (env->g_even ? 0u : 1u));
+        red = ((y & 1u) == (env->r_odd ? 1u : 0u));
+        by  = (y * BXM_GH) / b->rows;
+
+        for (c = 0; c < ncell; c += 2u)
+        {
+            unsigned v[2], gv, nv, *blk;
+
+            v[0] = bendx_get(row, c * 2u,      b->nbits);
+            v[1] = bendx_get(row, c * 2u + 1u, b->nbits);
+            if (v[0] > thr || v[1] > thr) continue;
+            if (v[gk] <= black + 2u) continue;
+
+            gv = (v[gk] - black) >> 2;
+            nv = (v[gk ^ 1u] > black) ? (v[gk ^ 1u] - black) >> 2 : 0u;
+            blk = g + 4u * (by * gx + c / BXM_GW);
+            blk[1] += gv;
+            if (red) { blk[0] += nv; blk[3] += 1u;       sr += (nv * gv) >> 10; wr += gv; }
+            else     { blk[2] += nv; blk[3] += 0x10000u; sb += (nv * gv) >> 10; wb += gv; }
+            sg += (gv * gv) >> 10;
+        }
+    }
+
+    // The white reference, /1024 like the sums. Too dark to say anything
+    // and the caller falls back to Classic.
+    wr >>= 10; wb >>= 10;
+    if (wr < 4u || wb < 4u) return 0;
+    m[0] = sr / wr;
+    m[1] = sg / (wr + wb);
+    m[2] = sb / wb;
+    if (m[0] < 2u || m[1] < 2u || m[2] < 2u) return 0;
+
+    // White: the sensor's own daylight white if the port knows it, else what
+    // was just measured.
+    if (env->neutral[0] && env->neutral[1] && env->neutral[2])
+        for (k = 0; k < 3; k++) wt[k] = env->neutral[k];
+    else
+        for (k = 0; k < 3; k++) wt[k] = m[k];
+
+    // The frame's strongest colour: every block's, weighted by how saturated
+    // it is.
+    for (i = 0; i < nblk; i++)
+    {
+        int d[3], w;
+
+        if (!bxm_chroma(g + i * 4u, wt, m[1], d)) continue;
+        // One wildly coloured block - a sign, a lamp - must not outvote the
+        // frame, and must not overflow the sum.
+        w = bxm_l1(d);
+        if (w > 1024) { for (k = 0; k < 3; k++) d[k] = d[k] * 1024 / w; w = 1024; }
+        w /= 16;
+        for (k = 0; k < 3; k++) dom[k] += d[k] * w;
+    }
+
+    // Normalised to full chroma - unless there is next to none, in which case
+    // green, which makes the frame's pair the classic pink and green.
+    while (bxm_l1(dom) > 65536) for (k = 0; k < 3; k++) dom[k] /= 2;
+    if (bxm_l1(dom) < 64) { dom[0] = -128; dom[1] = 256; dom[2] = -128; }
+    else { int n = bxm_l1(dom); for (k = 0; k < 3; k++) dom[k] = dom[k] * BXM_SAT / n; }
+
+    bxm_pair(dom, wt, (unsigned short *)(void *)(g + nblk * 4u));
+    if (x->tint != BXTINT_LOCAL) return 1;
+
+    for (i = 0; i < nblk; i++)
+    {
+        unsigned *blk = g + i * 4u;
+        int d[3] = { 0, 0, 0 }, n;
+
+        if (bxm_chroma(blk, wt, m[1], d))
+            for (k = 0; k < 3; k++) d[k] *= BXM_LGAIN;
+        n = bxm_l1(d);
+        if (n > BXM_SAT) { for (k = 0; k < 3; k++) d[k] = d[k] * BXM_SAT / n; n = BXM_SAT; }
+        // Whatever saturation the block lacks, the frame's colour supplies.
+        for (k = 0; k < 3; k++) d[k] += dom[k] * (BXM_SAT - n) / BXM_SAT;
+
+        // The block's sums are read; its sixteen bytes become its palette.
+        bxm_pair(d, wt, (unsigned short *)(void *)blk);
+    }
+    return 1;
+}
+
+//-------------------------------------------------------------------
+// Sky only.
+//
+// What a painting effect may paint over when the subject is protected: the
+// sky and the clouds in it, judged from one Bayer quad as it was before
+// anything was painted - its green and one of red or blue from this row, the
+// other from the row above (bx_melt keeps that per cell, unbent). Worked in
+// linear light against the sensor's white, so neutral means neutral.
+//
+//   1  blue sky:  blue clearly above red and not below green, and not black
+//   2  cloud:     bright, and close to neutral
+//   0  anything else - which is the subject: bronze, skin, leaves, a lamp
+//
+// A colour test, not a picture of the subject, so it has the limits of one:
+// a blue shirt counts as sky and a white wall as cloud. Against open sky -
+// the picture this is for - those are rarely in the way.
+
+static int bxm_sky(unsigned g, unsigned xv, unsigned prevx, int red,
+                   unsigned black, const unsigned *inv, int *lin)
+{
+    unsigned rv = red ? xv : prevx, bv = red ? prevx : xv;
+    int r  = (int)((((rv > black) ? rv - black : 0u) * inv[0]) >> 12);
+    int gg = (int)((((g  > black) ? g  - black : 0u) * inv[1]) >> 12);
+    int bb = (int)((((bv > black) ? bv - black : 0u) * inv[2]) >> 12);
+    int mx, mn, lum;
+
+    if (lin) { lin[0] = r; lin[1] = gg; lin[2] = bb; }
+    // Blue by a margin as well as a ratio, and not near black: in the
+    // shadows noise alone makes blue beat red half the time, and a black lamp
+    // would count as sky.
+    if (bb * 16 > r * 19 && bb * 16 >= gg * 15 && bb > 200 && bb - r > 48) return 1;
+
+    mx = (r > gg) ? r : gg;  if (bb > mx) mx = bb;
+    mn = (r < gg) ? r : gg;  if (bb < mn) mn = bb;
+    lum = (2 * r + 5 * gg + bb) >> 3;
+    if (lum > 1600 && (mx - mn) * 4 < mx) return 2;
+    return 0;
+}
+
+// Blend the Local palette's two grid rows around row y into rowpal - the
+// same as bx_melt does inline.
+static void bxm_rowpal(unsigned y, unsigned rows, const unsigned *grid,
+                       unsigned gx, unsigned short *rowpal)
+{
+    int fy = (int)((y * BXM_GH * 256u) / rows) - 128;
+    unsigned by0 = (fy > 0) ? (unsigned)fy >> 8 : 0u;
+    unsigned by1 = (by0 + 1u < BXM_GH) ? by0 + 1u : by0;
+    unsigned t = (fy > 0) ? (unsigned)fy & 255u : 0u;
+    const unsigned short *p0 = (const unsigned short *)(const void *)(grid + by0 * gx * 4u);
+    const unsigned short *p1 = (const unsigned short *)(const void *)(grid + by1 * gx * 4u);
+    unsigned c;
+
+    for (c = 0; c < gx * 8u; c++)
+        rowpal[c] = (unsigned short)((p0[c] * (256u - t) + p1[c] * t) >> 8);
+}
+
+//-------------------------------------------------------------------
+// Sky rain.
+//
+// Thin streaks of flat colour falling out of the clouds - taken from a
+// photograph, like Melt, and on the same footing. Where Melt drains every
+// highlight in a curtain with a white top and a green end, this is sparse:
+//
+//   - a streak starts only inside a cloud, a few cells wide, one colour all
+//     the way down - mostly the first colour, one in four the second;
+//   - lengths are skewed short, so most are dashes and a few run far;
+//   - starts cluster in curtains under some clouds and thin out elsewhere,
+//     from a smooth density field across the frame;
+//   - the clouds themselves pick up violet and pink blotches in their
+//     mid-tones, where the reference's are.
+//
+// Per cell: which colour it is streaking (pk, 0 = none) and how many rows are
+// left (pu). Starts are decided per unit of four cells and per eight rows, so
+// the cells of one streak start together and it reads as one line.
+//
+//   amount  density, reach  length, tint  colours (Classic is the
+//   reference's pink and periwinkle; Image and Local as for Melt), protect
+//   sky only - on by default, so the subject stays clear.
+
+static void bxm_rain(const bendx_t *x, const bendx_buf_t *b, const bendx_env_t *env,
+                     unsigned ncell, unsigned lbase, unsigned black, unsigned vmax,
+                     const unsigned *span, const unsigned *inv,
+                     const unsigned short *frame_pal, int local,
+                     const unsigned *grid, unsigned gx, unsigned short *rowpal,
+                     unsigned short *pk, unsigned short *pu, unsigned short *pv)
+{
+    // Linear /4096: the reference's pink, then its periwinkle.
+    static const unsigned short classic[6] = { 3277, 1147, 1720,  1352, 1352, 3523 };
+    unsigned mask = bx_planes(x, b->nbits);
+    int protect = (x->protect == BXPROT_SKY);
+    unsigned dens = (unsigned)x->amount + 3u;
+    int tinted = (frame_pal != bxm_classic);
+    unsigned y, c;
+
+    for (y = 0; y < b->rows; y++)
+    {
+        BX_TICK(y);
+        unsigned char *row = b->base + y * b->rowlen;
+        unsigned gk = ((y & 1u) ^ (env->g_even ? 0u : 1u));
+        int red = ((y & 1u) == (env->r_odd ? 1u : 0u));
+        int on = bx_on(x, y);
+
+        if (local) bxm_rowpal(y, b->rows, grid, gx, rowpal);
+
+        for (c = 0; c < ncell; c++)
+        {
+            unsigned i = c * 2u, v[2], prevx, k;
+            int cls = -1, lin[3];
+
+            v[0] = bendx_get(row, i,      b->nbits);
+            v[1] = bendx_get(row, i + 1u, b->nbits);
+            prevx = y ? pv[c] : v[gk ^ 1u];
+            pv[c] = (unsigned short)v[gk ^ 1u];
+
+            // A start, if this cell is idle, inside a cloud, and its unit's
+            // draw for this eight-row slot comes up.
+            if (!pk[c])
+            {
+                // Units of eight cells, a streak two to seven of them wide -
+                // a few pixels on the finished picture, as in the reference.
+                unsigned unit = c >> 3;
+                unsigned hu = xs32(x->seed ^ (unit * 0x9e3779b9u) ^ ((y >> 3) * 0x85ebca6bu));
+                unsigned w = 2u + ((hu >> 4) & 3u) + ((hu >> 6) & 2u);
+
+                if ((c & 7u) < w)
+                {
+                    unsigned f = bxm_shape(x->seed ^ 0x2545f491u, unit);
+                    unsigned thresh = (dens * ((f * f) >> 8) * 27u) >> 3;
+
+                    if ((hu & 0xffffu) < thresh)
+                    {
+                        cls = bxm_sky(v[gk], v[gk ^ 1u], prevx, red, black, inv, lin);
+                        if (cls == 2)
+                        {
+                            // Skewed short, up to twice the reach: mostly
+                            // dashes, a few that fall a long way.
+                            unsigned r = 40u + ((hu >> 16) & 215u);
+                            unsigned L = (lbase * 2u * r * r) >> 16;
+                            L = (L * (248u + (xs32(x->seed ^ (c * 0x27d4eb2du)) & 15u))) >> 8;
+                            if (L < 4u) L = 4u;
+                            if (L > 65535u) L = 65535u;
+                            pk[c] = (unsigned short)((((hu >> 24) & 7u) >= 6u) ? 2u : 1u);
+                            pu[c] = (unsigned short)L;
+                        }
+                    }
+                }
+            }
+
+            if (pk[c])
+            {
+                int paint = on;
+
+                if (paint && protect)
+                {
+                    if (cls < 0) cls = bxm_sky(v[gk], v[gk ^ 1u], prevx, red, black, inv, lin);
+                    paint = (cls != 0);
+                }
+
+                if (paint)
+                {
+                    unsigned short pal[6];
+                    unsigned base = (pk[c] == 2u) ? 3u : 0u;
+
+                    if (!tinted)
+                        for (k = 0; k < 6u; k++) pal[k] = classic[k];
+                    else
+                    {
+                        const unsigned short *src = frame_pal;
+                        unsigned short blend[6];
+                        if (local)
+                        {
+                            int fx = (int)(c * (256u / BXM_GW)) - 128;
+                            unsigned bx0 = (fx > 0) ? (unsigned)fx >> 8 : 0u;
+                            unsigned bx1 = (bx0 + 1u < gx) ? bx0 + 1u : bx0;
+                            unsigned t = (fx > 0) ? (unsigned)fx & 255u : 0u;
+                            for (k = 0; k < 6u; k++)
+                                blend[k] = (unsigned short)((rowpal[bx0 * 8u + k] * (256u - t)
+                                                           + rowpal[bx1 * 8u + k] * t) >> 8);
+                            src = blend;
+                        }
+                        for (k = 0; k < 6u; k++) pal[k] = src[k];
+                    }
+
+                    for (k = 0; k < 2u; k++)
+                    {
+                        unsigned ch = (k == gk) ? 1u : (red ? 0u : 2u);
+                        unsigned o;
+
+                        // Classic is linear light against the sensor's white.
+                        // A palette is already raw, relative to a highlight;
+                        // a rain colour is a flat level, four fifths of the
+                        // range (span[1] is the whole range: green's white is
+                        // the reference).
+                        if (!tinted) o = black + ((pal[base + ch] * span[ch]) >> 12);
+                        else         o = black + ((((pal[base + ch] * 3277u) >> 14) * span[1]) >> 14);
+                        if (o > vmax) o = vmax;
+                        bendx_set(row, i + k, bx_mixv(v[k], o, mask, x->mix), b->nbits);
+                    }
+                }
+
+                if (--pu[c] == 0) pk[c] = 0;
+                continue;
+            }
+
+            // Not streaking: the cloud tint, in blotches, strongest in the
+            // cloud's mid-tones and gone in its brightest and darkest parts.
+            if (!on) continue;
+            if (cls < 0) cls = bxm_sky(v[gk], v[gk ^ 1u], prevx, red, black, inv, lin);
+            if (cls == 2)
+            {
+                int lum = (2 * lin[0] + 5 * lin[1] + lin[2]) >> 3;
+                unsigned hb = xs32(x->seed ^ ((c >> 3) * 0x68e31da4u) ^ ((y >> 4) * 0xb5297a4du));
+                unsigned n = hb & 255u;
+                int wgt, s;
+
+                if (lum <= 800 || lum >= 4000 || n <= 140u) continue;
+                wgt = (lum < 2400) ? ((lum - 800) * 256) / 1600 : ((4000 - lum) * 256) / 1600;
+                s = ((int)(n - 140u) * 2 * wgt) >> 8;           // 0 .. 230
+
+                for (k = 0; k < 2u; k++)
+                {
+                    int violet = (int)((hb >> 8) & 1u);
+                    unsigned ch = (k == gk) ? 1u : (red ? 0u : 2u);
+                    int f;
+                    unsigned o;
+
+                    if (ch == 1u)      f = 256 - ((s * 90) >> 8);
+                    else if (ch == 0u) f = 256 + ((s * (violet ? 26 : 77)) >> 8);
+                    else               f = 256 + ((s * (violet ? 77 : 31)) >> 8);
+
+                    o = (v[k] > black) ? v[k] - black : 0u;
+                    o = black + ((o * (unsigned)f) >> 8);
+                    if (o > vmax) o = vmax;
+                    bendx_set(row, i + k, bx_mixv(v[k], o, mask, x->mix), b->nbits);
+                }
+            }
+        }
+    }
+}
+
+static void bx_melt(const bendx_t *x, const bendx_buf_t *b,
+                    const bendx_env_t *env, unsigned char *s)
+{
+    unsigned mask = bx_planes(x, b->nbits);
+    unsigned len = b->rowlen;
+    unsigned npix = bx_wholepix(b);
+    unsigned ncell = npix / 2u;
+    unsigned vmax = (1u << b->nbits) - 1u;
+    unsigned white = env->white ? env->white : vmax;
+    unsigned black = env->black;
+    // See bendx_scratch_bytes: 4 * ncell shorts, then the palette grid.
+    unsigned short *pk = (unsigned short *)(void *)s;   // level above black, 0 = idle
+    unsigned short *pu = pk + ncell;                    // position, BXM_ONE = length
+    unsigned short *du = pu + ncell;                    // step per row, 0 = in the source
+    unsigned short *pv = du + ncell;                    // last row's red or blue, unbent
+    unsigned *grid = (unsigned *)(void *)(s + ((8u * ncell + 3u) & ~3u));
+    unsigned gx = bxm_grid_cols(ncell);
+    const unsigned short *frame_pal = bxm_classic;
+    // The blended row, after the grid and the frame's own pair.
+    unsigned short *rowpal = (unsigned short *)(void *)(grid + (gx * BXM_GH + 1u) * 4u);
+    int local = 0;
+    int rain = (x->kind == BX_RAIN);
+    int protect = (x->protect == BXPROT_SKY);
+    unsigned span[3], inv[3];
+    unsigned thr, lbase, y, c;
+    int k0;
+
+    if (!ncell) return;
+    if (white > vmax) white = vmax;
+    if (black >= white) black = 0;
+
+    // amount 0 takes only what is clipped or nearly; 15 takes the top third.
+    // Rain's amount is its density, and only the palette sampler reads thr
+    // there - to leave the clipped highlights out of the scene's colour.
+    thr = white - ((white - black) * (rain ? 1u : (unsigned)x->amount + 1u)) / 48u;
+    // reach 0 is about a twentieth of the frame, 15 under a third.
+    lbase = (b->rows * ((unsigned)x->reach + 3u)) / 64u;
+    if (lbase < 8u) lbase = 8u;
+
+    // Linear light /4096 per channel, the sensor's white at 4096 in each -
+    // what the sky test and Rain's flat colours are worked in.
+    for (k0 = 0; k0 < 3; k0++)
+    {
+        unsigned n = env->neutral[k0] ? env->neutral[k0] : 1000u;
+        span[k0] = ((white - black) * n) / 1000u;
+        if (!span[k0]) span[k0] = 1;
+        inv[k0] = (1u << 24) / span[k0];
+    }
+
+    if (x->tint != BXTINT_CLASSIC
+     && bxm_palette(x, b, env, ncell, thr, black, grid, gx))
+    {
+        frame_pal = (const unsigned short *)(const void *)(grid + gx * BXM_GH * 4u);
+        local = (x->tint == BXTINT_LOCAL);
+    }
+
+    for (c = 0; c < ncell; c++) pk[c] = pu[c] = du[c] = pv[c] = 0;
+
+    if (rain)
+    {
+        bxm_rain(x, b, env, ncell, lbase, black, vmax, span, inv,
+                 frame_pal, local, grid, gx, rowpal, pk, pu, pv);
+        return;
+    }
+
+    for (y = 0; y < b->rows; y++)
+    {
+        BX_TICK(y);
+        unsigned char *row = b->base + (unsigned)y * len;
+        // Which pixel of the cell is green on this row, and whether the other
+        // one is red or blue.
+        unsigned gk = ((y & 1u) ^ (env->g_even ? 0u : 1u));
+        int red = ((y & 1u) == (env->r_odd ? 1u : 0u));
+        int on = bx_on(x, y);
+
+        // Local: blend the two grid rows whose centres this row lies between
+        // into the row buffer, so colours change smoothly down the frame.
+        if (local)
+        {
+            int fy = (int)((y * BXM_GH * 256u) / b->rows) - 128;
+            unsigned by0 = (fy > 0) ? (unsigned)fy >> 8 : 0u;
+            unsigned by1 = (by0 + 1u < BXM_GH) ? by0 + 1u : by0;
+            unsigned t = (fy > 0) ? (unsigned)fy & 255u : 0u;
+            const unsigned short *p0 = (const unsigned short *)(const void *)(grid + by0 * gx * 4u);
+            const unsigned short *p1 = (const unsigned short *)(const void *)(grid + by1 * gx * 4u);
+
+            for (c = 0; c < gx * 8u; c++)
+                rowpal[c] = (unsigned short)((p0[c] * (256u - t) + p1[c] * t) >> 8);
+        }
+
+        for (c = 0; c < ncell; c++)
+        {
+            unsigned i = c * 2u;
+            unsigned v[2], k, u, h, p, bu, rc;
+            unsigned short pal[6];
+
+            unsigned prevx;
+
+            v[0] = bendx_get(row, i,      b->nbits);
+            v[1] = bendx_get(row, i + 1u, b->nbits);
+
+            // The other colour of this quad, from the row above as it was
+            // before anything here painted it - so the sky test below sees
+            // the scene, not a streak. Kept for every cell, every row.
+            prevx = y ? pv[c] : v[gk ^ 1u];
+            pv[c] = (unsigned short)v[gk ^ 1u];
+
+            // In a highlight: (re)start the streak from here.
+            if (v[0] > thr || v[1] > thr)
+            {
+                unsigned m = (v[0] > v[1]) ? v[0] : v[1];
+                pk[c] = (unsigned short)(m - black);
+                pu[c] = 0;
+                du[c] = 0;
+                continue;
+            }
+            if (!pk[c]) continue;
+
+            // First row out of the highlight: fix this streak's length. A
+            // highlight only just over the threshold runs half as far as one
+            // that is clipped.
+            if (!du[c])
+            {
+                unsigned room = white - thr + 1u;
+                unsigned over = (unsigned)pk[c] + black;
+                unsigned L;
+
+                over = (over > thr) ? over - thr : 0u;
+                L = (lbase * bxm_shape(x->seed, c)) >> 8;
+                L = (L * (128u + (over * 128u) / room)) >> 8;
+                if (L < 4u) L = 4u;
+                p = (BXM_ONE + L / 2u) / L;
+                du[c] = (unsigned short)(p ? p : 1u);
+            }
+
+            u = (unsigned)pu[c] + du[c];
+            if (u >= BXM_END) { pk[c] = 0; continue; }
+            pu[c] = (unsigned short)u;
+
+            // Carried whether or not the row is in scope, as in the bloom.
+            if (!on) continue;
+
+            // Protected: the streak goes on down, but behind the subject.
+            if (protect && !bxm_sky(v[gk], v[gk ^ 1u], prevx, red, black, inv, 0))
+                continue;
+
+            p = pk[c];
+            h = xs32(x->seed ^ 0x5bd1e995u ^ (c * 0x9e3779b9u));
+            // End band: twenty-four to fifty-five rows past the end, never
+            // more than a third of the streak. Red stops two to five rows early.
+            bu = du[c] * (24u + ((h >> 8) & 31u));
+            if (bu > BXM_ONE / 3u) bu = BXM_ONE / 3u;
+            rc = du[c] * (2u + ((h >> 16) & 3u));
+            // Local takes the colour of where the streak is now, not where it
+            // started, so it changes as it runs down; blended across the two
+            // blocks whose centres this cell lies between.
+            if (local)
+            {
+                int fx = (int)(c * (256u / BXM_GW)) - 128;
+                unsigned bx0 = (fx > 0) ? (unsigned)fx >> 8 : 0u;
+                unsigned bx1 = (bx0 + 1u < gx) ? bx0 + 1u : bx0;
+                unsigned t = (fx > 0) ? (unsigned)fx & 255u : 0u;
+
+                for (k = 0; k < 6u; k++)
+                    pal[k] = (unsigned short)((rowpal[bx0 * 8u + k] * (256u - t)
+                                             + rowpal[bx1 * 8u + k] * t) >> 8);
+            }
+            else
+                for (k = 0; k < 6u; k++) pal[k] = frame_pal[k];
+
+            for (k = 0; k < 2u; k++)
+            {
+                unsigned ch = (k == gk) ? 1u : (red ? 0u : 2u);
+                unsigned un = (ch == 0u) ? u + rc : u;
+                unsigned q = 0, o;
+
+                // Body: white where it leaves the highlight, fading to the
+                // body colour, with a hard end.
+                if (un < BXM_ONE)
+                {
+                    unsigned base = pal[ch];
+                    if (u < BXM_TOP)
+                        base = BXM_ONE - (((BXM_ONE - base) * u * 6u) >> 14);
+                    q = (base * bxm_body(un)) >> 14;
+                }
+                // End band, from a little before the body ends.
+                if (u + BXM_GPRE >= BXM_ONE && u < BXM_ONE + bu && pal[3u + ch] > q)
+                    q = pal[3u + ch];
+
+                o = black + ((p * q) >> 14);
+                if (o > vmax) o = vmax;
+                if (o > v[k])
+                    bendx_set(row, i + k, bx_mixv(v[k], o, mask, x->mix), b->nbits);
+            }
+        }
+    }
+}
+
+//-------------------------------------------------------------------
+// Aerochrome.
+//
+// Kodak Aerochrome III 1443 was a false-colour reversal film with three layers
+// that see the wrong things: the one that ends up red is sensitive to near
+// infrared, the one that ends up green to red, the one that ends up blue to
+// green. Every layer is also blue-sensitive, so it was shot through a yellow
+// filter that throws blue away. Living leaves reflect near infrared about
+// three times as strongly as green, so foliage comes out magenta to red, a
+// blue sky comes out deep blue, red things come out yellow and skin waxy.
+//
+// The A540 sees no infrared at all - there is a hot mirror over the sensor -
+// so the infrared layer is an estimate, and that is the one honest limit of
+// this: it is made from how much greener than red and blue each patch is,
+// which is chlorophyll's visible signature. Green paint will glow like a
+// tree; a dry or autumn leaf will not, though on film it would.
+//
+// Per Bayer quad, so every site has all three colours to work from: the quad
+// is white balanced against the sensor's daylight white, put through the
+// layer mapping, saturated - the film was punchy, and the dyes are what make
+// it look like itself - and written back site by site. The greens keep their
+// own difference from the quad's mean, which is most of the detail; red and
+// blue are single per quad anyway.
+//
+//   amount  how strongly foliage glows: the infrared gain on greenness
+//   reach   dye saturation
+//   tint    the filter: yellow 12 as Kodak recommended, orange 21 and red 25
+//           darkening the green-sensitive (blue-printing) layer, as they did
+
+static void bx_aero(const bendx_t *x, const bendx_buf_t *b, const bendx_env_t *env)
+{
+    static const int filt[3] = { 256, 166, 90 };    // blue-printing layer, /256
+    unsigned mask = bx_planes(x, b->nbits);
+    unsigned len = b->rowlen;
+    unsigned npix = bx_wholepix(b) & ~1u;
+    unsigned vmax = (1u << b->nbits) - 1u;
+    unsigned white = env->white ? env->white : vmax;
+    unsigned black = env->black;
+    unsigned span[3], inv[3];
+    int gain = 48 + 8 * (int)x->amount;             // /16: 3 .. 10.5
+    int sat  = 358 + 26 * (int)x->reach;            // /256: 1.4 .. 2.9
+    int bf   = filt[(x->tint <= BXTINT_RED) ? x->tint : 0];
+    unsigned y, i;
+    int k;
+
+    if (npix < 2u || b->rows < 2u) return;
+    if (white > vmax) white = vmax;
+    if (black >= white) black = 0;
+
+    // Linear light /4096 per channel, with the sensor's white at 4096 in each.
+    for (k = 0; k < 3; k++)
+    {
+        unsigned n = env->neutral[k] ? env->neutral[k] : 1000u;
+        span[k] = ((white - black) * n) / 1000u;
+        if (!span[k]) span[k] = 1;
+        inv[k] = (1u << 24) / span[k];
+    }
+
+    for (y = 0; y + 1u < b->rows; y += 2u)
+    {
+        unsigned char *row[2];
+        int ch[4];
+
+        BX_TICK(y);
+        if (!bx_on(x, y)) continue;
+        row[0] = b->base + y * len;
+        row[1] = row[0] + len;
+
+        // The four sites of a quad, in order (0,0) (1,0) (0,1) (1,1): which
+        // colour each is. The same for every quad in the row pair.
+        for (k = 0; k < 4; k++)
+        {
+            unsigned sx = (unsigned)(k & 1), sy = y + (unsigned)(k >> 1);
+            if ((((sx + sy) & 1u) ^ (env->g_even ? 1u : 0u)) != 0) ch[k] = 1;
+            else ch[k] = ((sy & 1u) == (env->r_odd ? 1u : 0u)) ? 0 : 2;
+        }
+
+        for (i = 0; i < npix; i += 2u)
+        {
+            unsigned v[4];
+            int lin[4], c[3] = { 0, 0, 0 }, o[3], gsum = 0, gn = 0, veg, sky, yl;
+
+            for (k = 0; k < 4; k++)
+            {
+                v[k] = bendx_get(row[k >> 1], i + (unsigned)(k & 1), b->nbits);
+                lin[k] = (int)((((v[k] > black) ? v[k] - black : 0u) * inv[ch[k]]) >> 12);
+                if (ch[k] == 1) { gsum += lin[k]; gn++; }
+                else c[ch[k]] = lin[k];
+            }
+            c[1] = gn ? gsum / gn : 0;
+
+            // The layers. Red prints the infrared estimate, green prints red,
+            // blue prints green through the filter.
+            veg = c[1] - ((c[0] > c[2]) ? c[0] : c[2]);
+            if (veg < 0) veg = 0;
+            // Blue sky and water carry next to no infrared - scattered light
+            // is short-wave, and water absorbs it - which is what makes them
+            // the film's deep blue rather than violet. Blueness takes it away.
+            sky = c[2] - ((c[0] > c[1]) ? c[0] : c[1]);
+            if (sky < 0) sky = 0;
+            o[0] = c[0] + ((gain * veg) >> 4) - sky;
+            if (o[0] < 0) o[0] = 0;
+            o[1] = c[0];
+            o[2] = (c[1] * bf) >> 8;
+
+            // Dye saturation, about the layer mix's own luminance.
+            yl = (2 * o[0] + 5 * o[1] + o[2]) >> 3;
+            for (k = 0; k < 3; k++)
+            {
+                o[k] = yl + (((o[k] - yl) * sat) >> 8);
+                if (o[k] < 0) o[k] = 0;
+                if (o[k] > 8191) o[k] = 8191;
+            }
+
+            for (k = 0; k < 4; k++)
+            {
+                int out = o[ch[k]];
+                unsigned w;
+
+                // Each green keeps its own offset from the quad's mean.
+                if (ch[k] == 1) out += lin[k] - c[1];
+                if (out < 0) out = 0;
+                w = black + (((unsigned)out * span[ch[k]]) >> 12);
+                if (w > vmax) w = vmax;
+                bendx_set(row[k >> 1], i + (unsigned)(k & 1),
+                          bx_mixv(v[k], w, mask, x->mix), b->nbits);
+            }
+        }
+    }
+}
+
+//-------------------------------------------------------------------
 
 void bendx_apply(const bendx_t *x, const bendx_buf_t *buf,
                  const bendx_env_t *env, unsigned char *scratch)
@@ -1432,6 +2342,9 @@ void bendx_apply(const bendx_t *x, const bendx_buf_t *buf,
     case BX_SORT:    bx_sort(x, buf, s0);                                   break;
     case BX_LOCK:    bx_lock(x, buf, s0, s1);                               break;
     case BX_JPGBUS:  bx_membus(x, buf, env->jpg, env->jpg_len);             break;
+    case BX_MELT:    bx_melt(x, buf, env, s0);                              break;
+    case BX_AERO:    bx_aero(x, buf, env);                                  break;
+    case BX_RAIN:    bx_melt(x, buf, env, s0);                              break;
     default: break;
     }
 }

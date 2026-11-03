@@ -39,6 +39,8 @@
 #include "theme.h"
 #include "properties.h"
 #include "shooting.h"
+#include "modes.h"
+#include "modelist.h"
 #include "gui_recui.h"
 
 #ifdef CAM_RECUI
@@ -432,6 +434,8 @@ static void recui_write(int prop, int val, int is_signed)
 #endif
 }
 
+static int recui_save_pending;      // a size/quality choice not yet on the card
+
 static void recui_set(const recui_ctl *c, int idx)
 {
     switch (c->kind)
@@ -460,6 +464,19 @@ static void recui_set(const recui_ctl *c, int idx)
         // it costs nothing on a body with no native MF.
         if (c->prop == PROPCASE_REAL_FOCUS_MODE)
             recui_write(PROPCASE_FOCUS_MODE, 0, 0);
+
+        // Remember size and quality - see recui_keep_image(). Only a change
+        // marks the config for saving, so the keep-alive writing the same
+        // value back does not.
+        {
+            int *keep = (c->prop == PROPCASE_RESOLUTION) ? &conf.recui_size
+                      : (c->prop == PROPCASE_QUALITY)    ? &conf.recui_quality : 0;
+            if (keep && *keep != idx + 1)
+            {
+                *keep = idx + 1;
+                recui_save_pending = 1;
+            }
+        }
 
 #ifdef CAM_RECUI_APPLY_IMAGE
         // Size and quality need the port's apply call after the write - on
@@ -962,12 +979,77 @@ static void recui_erase(int x, int y, int w, int h)
 // The menu is the exception and reads its properties back on each repaint. It
 // only repaints on a keypress, so that is a handful of firmware calls when a
 // key moves, not a per-pass cost.
+//-------------------------------------------------------------------
+// Keeping size and quality.
+//
+// Canon holds the image settings per shooting mode in its own store and copies
+// them into the property cases at power-on and on every mode change. Only
+// Canon's FUNC menu writes that store, and CAM_RECUI replaces that menu - so a
+// size picked here was right until the dial moved or the camera was switched
+// off, and then Canon put its stored one back.
+//
+// Rather than reverse Canon's store, the choice lives in CHDK's config and is
+// put back after Canon has finished: once the mode has been stable for
+// RECUI_KEEP_SETTLE_MS, checked every RECUI_KEEP_EVERY_MS, and only written
+// when it differs. Never while shooting or while the FUNC menu is open, and not
+// in movie or stitch assist, whose size is not the still-picture one.
+
+#define RECUI_KEEP_SETTLE_MS    1500
+#define RECUI_KEEP_EVERY_MS     500
+
+static void recui_keep_one(int prop, int keep)
+{
+    int i;
+
+    if (keep <= 0) return;
+    for (i = 0; i < RECUI_MENU_N; i++)
+    {
+        const recui_ctl *c = &recui_menu[i];
+        if (c->kind != RK_PROP || c->prop != prop) continue;
+        if (keep > c->n) return;
+        if ((short)shooting_get_prop(prop) != (short)c->vals[keep - 1])
+            recui_set(c, keep - 1);
+        return;
+    }
+}
+
+static void recui_keep_image(void)
+{
+    static int last_mode = -1, mode_since, last_check;
+    int t = get_tick_count();
+    int m;
+
+    // Written from here, the GUI task, rather than from the keypress that
+    // changed it: that runs in the keyboard task, and a card write there
+    // would stall the keys.
+    if (recui_save_pending && !recui_menu_open && recui_sel_ctl < 0)
+    {
+        recui_save_pending = 0;
+        conf_save();
+    }
+
+    if (last_check && (t - last_check) < RECUI_KEEP_EVERY_MS) return;
+    last_check = t;
+
+    m = mode_get();
+    if ((m & MODE_MASK) != MODE_REC) { last_mode = -1; return; }
+    if (m != last_mode) { last_mode = m; mode_since = t; return; }
+    if ((t - mode_since) < RECUI_KEEP_SETTLE_MS) return;
+    if (MODE_IS_VIDEO(m) || (m & MODE_SHOOTING_MASK) == MODE_STITCH) return;
+    if (recui_menu_open || !recui_can_change()) return;
+
+    recui_keep_one(PROPCASE_RESOLUTION, conf.recui_size);
+    recui_keep_one(PROPCASE_QUALITY,    conf.recui_quality);
+}
+
 void recui_draw(int force)
 {
     const recui_ctl *c;
     color bg, fg;
     int x, y, i, idx;
     char buf[RECUI_CHARS + 1];
+
+    recui_keep_image();
 
     if (recui_menu_open)
     {
