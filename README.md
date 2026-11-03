@@ -1,4 +1,4 @@
-# CHDK Rewired Fork With fixes for the a540
+# CHDK Rewired Fork With New Features and Fixes
 
 A fork of [CHDK_Rewired](https://github.com/lr-m/CHDK_Rewired) that fixes an issue with the a540 causing it to crash after 1-2 flash photos are taken. 
 
