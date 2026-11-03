@@ -417,6 +417,18 @@ void core_spytask()
         // A bent shot may be waiting to have its recipe written into it - see
         // include/bend_tag.h. Costs one comparison per pass when nothing is
         // queued, which is every pass but a handful.
+        //
+        // Not while a shot is in flight. On the VxWorks bodies (no
+        // CAM_BEND_TAG_INJECT) the service opens Canon's JPEG and then reopens
+        // it for append, from this task, while Canon's FileWrite task may still
+        // have it open - and, with the shutter down again, while the next frame
+        // is being exposed and written. Two writers on one dosFs file is FAT
+        // corruption at best. Deferring costs nothing: the job stays pending
+        // and its own give-up timer still runs.
+        if (!shooting_in_progress()
+         && camera_info.state.state_shooting_progress != SHOOTING_PROGRESS_PROCESSING
+         && !camera_info.state.is_shutter_half_press
+         && !kbd_is_key_pressed(KEY_SHOOT_FULL))
         {
             extern void bend_tag_service(void);
             bend_tag_service();

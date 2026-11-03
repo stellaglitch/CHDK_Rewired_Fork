@@ -197,13 +197,26 @@ long kbd_update_key_state(void)
     // Full press only. The half press is already handled by the ordinary hide
     // test in posd_screen_active(), and nothing is frozen at half press, so
     // taking the hold there would only delay the overlay coming back after
-    // framing. Called on the level rather than the edge: it costs a compare
-    // once the screen is already clear, and holding the deadline forward while
-    // the shutter is down is exactly the wanted behaviour.
+    // framing.
+    //
+    // The full-screen wipe is done on the press EDGE only. It used to be done
+    // on the level, on the belief that it "costs a compare once the screen is
+    // already clear" - it does not: clear_all redraws the whole bitmap (both
+    // buffers) on every call, so holding the shutter ran a full-screen fill
+    // from this task every 10ms. A flash shot is exactly the case where the
+    // shutter stays down longest - pre-flash metering, and Canon waiting on
+    // the strobe to recharge before it fires the second shot - so the physw
+    // task, which runs above almost everything, ate the CPU the strobe charge
+    // and capture sequence needed. Nothing CHDK draws is allowed back while the
+    // shutter is held (posd_screen_active/posd_grid_active/gui_shot_ui_hidden
+    // all test KEY_SHOOT_FULL), so one wipe at the edge is enough; the level
+    // call below only pushes the hold deadline forward, which is a compare.
     {
         extern void posd_hide_now(int hold_ms, int clear_all);
-        if (kbd_is_key_pressed(KEY_SHOOT_FULL))
+        if (kbd_is_key_clicked(KEY_SHOOT_FULL))
             posd_hide_now(CAM_PERSISTENT_OSD_SHOT_HIDE_MS, 1);
+        else if (kbd_is_key_pressed(KEY_SHOOT_FULL))
+            posd_hide_now(CAM_PERSISTENT_OSD_SHOT_HIDE_MS, 0);
     }
 #endif
 
